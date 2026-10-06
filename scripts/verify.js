@@ -12,6 +12,9 @@
  *      - 激活后的竞争候选与迟到补签被拒；
  *      - 并发竞争候选只收敛为一个活动检查点；
  *      - 应用重启后链头、历史检查点与签名证据保持一致；
+ *      - 跨设备域同名候选（父公钥相同、新公钥集不同）：重启不串用签名，
+ *        第二个候选仅收到自身一名签名时继续待签，两名父成员都签本候选
+ *        规范 UTF-8 消息后才激活，证据逐份验证对应候选；
  *      - 健康端点反映设备域状态。
  *   全部通过退出码 0，否则退出码 1。
  */
@@ -20,8 +23,15 @@ const { spawnSync } = require('node:child_process');
 const crypto = require('node:crypto');
 const path = require('node:path');
 
+const rotation = require('../src/rotation');
+
 const ROOT = path.join(__dirname, '..');
 const APP_URL = (process.env.APP_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+
+/** 逐份证据核对：签名必须通过“该候选自身规范 UTF-8 消息”的 Ed25519 验签。 */
+function rotationVerify(message, signatureHex, publicKeyHex) {
+  return rotation.verifyAuthorization(message, signatureHex, publicKeyHex);
+}
 
 let failures = 0;
 
@@ -289,6 +299,216 @@ async function main() {
     assertEqual(head.digest, rotationDigest, '竞争请求改变了链头');
   });
 
+  // —— 跨设备域同名候选：相同父公钥集、相同轮换标识，不同新公钥集 ——
+  const crossA = genKey();
+  const crossB = genKey();
+  const crossNewX = [genKey(), genKey()];
+  const crossNewY = [genKey(), genKey()];
+  let domXId;
+  let domYId;
+  let headXGenesis;
+  let headYGenesis;
+  let rotXDigest;
+  let rotYDigest;
+  let msgCrossX;
+  let msgCrossY;
+  let sigCrossAonX;
+
+  await step('跨域同名候选：创建两个父公钥相同、门限均为二的设备域', async () => {
+    const rx = await api('POST', '/api/domains', {
+      name: '跨域同名-X',
+      publicKeys: [crossB.publicKey, crossA.publicKey],
+      threshold: 2,
+    });
+    assertEqual(rx.status, 201, `创建设备域 X 失败：${rx.text}`);
+    domXId = rx.json.id;
+    headXGenesis = rx.json.headDigest;
+
+    const ry = await api('POST', '/api/domains', {
+      name: '跨域同名-Y',
+      publicKeys: [crossB.publicKey, crossA.publicKey],
+      threshold: 2,
+    });
+    assertEqual(ry.status, 201, `创建设备域 Y 失败：${ry.text}`);
+    domYId = ry.json.id;
+    headYGenesis = ry.json.headDigest;
+    assert(
+      JSON.stringify(rx.json.keys) === JSON.stringify(ry.json.keys),
+      '两个设备域应使用相同的父公钥集',
+    );
+    assert(headXGenesis !== headYGenesis, '域 ID 不同，创世链头摘要必须不同');
+  });
+
+  await step('跨域同名候选：分别建立同名轮换候选，但新公钥集不同', async () => {
+    const cx = await api('POST', `/api/domains/${domXId}/rotations`, {
+      rotationId: 'shared-rot',
+      parentDigest: headXGenesis,
+      publicKeys: crossNewX.map((k) => k.publicKey),
+      threshold: 2,
+    });
+    assertEqual(cx.status, 201, `X 域创建候选失败：${cx.text}`);
+    rotXDigest = cx.json.digest;
+
+    const cy = await api('POST', `/api/domains/${domYId}/rotations`, {
+      rotationId: 'shared-rot',
+      parentDigest: headYGenesis,
+      publicKeys: crossNewY.map((k) => k.publicKey),
+      threshold: 2,
+    });
+    assertEqual(cy.status, 201, `Y 域创建候选失败：${cy.text}`);
+    rotYDigest = cy.json.digest;
+
+    const mx = await api('GET', `/api/domains/${domXId}/rotations/shared-rot/message`);
+    const my = await api('GET', `/api/domains/${domYId}/rotations/shared-rot/message`);
+    msgCrossX = mx.json.message;
+    msgCrossY = my.json.message;
+    assert(msgCrossX !== msgCrossY, '设备域不同，规范 UTF-8 待签消息必须不同');
+    assert(msgCrossX.includes(`domain=${domXId}`), 'X 消息须绑定 X 域');
+    assert(msgCrossY.includes(`domain=${domYId}`), 'Y 消息须绑定 Y 域');
+  });
+
+  await step('跨域同名候选：只为第一个候选提交一名父成员的有效签名', async () => {
+    sigCrossAonX = sign(crossA, msgCrossX);
+    const res = await api('POST', `/api/domains/${domXId}/rotations/shared-rot/signatures`, {
+      signatures: [{ publicKey: crossA.publicKey, signature: sigCrossAonX }],
+    });
+    assertEqual(res.status, 200, `提交签名失败：${res.text}`);
+    assertEqual(res.json.results[0].status, 'accepted', 'X 候选的有效签名应被接受');
+    assertEqual(res.json.activated, false, '1/2 不应激活');
+    const yDetail = (await api('GET', `/api/domains/${domYId}`)).json;
+    const yRot = yDetail.rotations.find((r) => r.rotationId === 'shared-rot');
+    assertEqual(yRot.signers, 0, 'X 的签名不得出现在 Y 候选上');
+    assertEqual(yDetail.headDigest, headYGenesis, 'Y 链头仍应是创世检查点');
+  });
+
+  await step('跨域同名候选：重启应用后两域状态不串用', async () => {
+    const restart = await api('POST', '/api/admin/restart');
+    assertEqual(restart.status, 202, `重启端点应返回 202：${restart.text}`);
+    const health = await waitForHealth(60000, (h) => h.bootId !== bootId);
+    bootId = health.bootId; // 更新为新进程，供后续重启等待使用。
+
+    const dx = (await api('GET', `/api/domains/${domXId}`)).json;
+    const dy = (await api('GET', `/api/domains/${domYId}`)).json;
+    const rx = dx.rotations.find((r) => r.rotationId === 'shared-rot');
+    const ry = dy.rotations.find((r) => r.rotationId === 'shared-rot');
+    assertEqual(rx.signers, 1, '重启后 X 候选应保留自身的 1 份签名');
+    assertEqual(ry.signers, 0, '重启后 Y 候选不得带出来自 X 候选的签名');
+    assertEqual(dx.headDigest, headXGenesis, 'X 链头不应变化');
+    assertEqual(dy.headDigest, headYGenesis, 'Y 链头不应变化');
+  });
+
+  await step('跨域同名候选：第二个候选只收到自身一名签名时继续待签（链头/详情/页面/健康一致）', async () => {
+    // 另一名父成员针对 Y 候选“自身待签消息”签名。
+    const sigCrossBonY = sign(crossB, msgCrossY);
+    const res = await api('POST', `/api/domains/${domYId}/rotations/shared-rot/signatures`, {
+      signatures: [{ publicKey: crossB.publicKey, signature: sigCrossBonY }],
+    });
+    assertEqual(res.status, 200, `提交签名失败：${res.text}`);
+    assertEqual(res.json.results[0].status, 'accepted', 'Y 自身有效签名应被接受');
+    assertEqual(res.json.activated, false, '仅 1/2 本域签名，候选必须继续待签');
+    assertEqual(res.json.signers, 1);
+    assertEqual(res.json.headDigest, headYGenesis, '未达门限链头不得前进');
+
+    const head = (await api('GET', `/api/domains/${domYId}/head`)).json;
+    assertEqual(head.digest, headYGenesis, '链头接口不得把未授权检查点显示为已激活');
+    assertEqual(head.generation, 0);
+    assertEqual(head.evidence.length, 0, '待签候选不得产生链头证据');
+
+    const detail = (await api('GET', `/api/domains/${domYId}`)).json;
+    assertEqual(detail.headDigest, headYGenesis, '域详情中的链头必须仍是创世检查点');
+    const rot = detail.rotations.find((r) => r.rotationId === 'shared-rot');
+    assertEqual(rot.status, 'pending', '域详情中候选必须显示为待签');
+    assertEqual(rot.signatures.length, 1);
+    // 逐份核对：Y 上这份证据能验证 Y 候选，但不能验证 X 候选。
+    assertEqual(
+      rotationVerify(msgCrossY, rot.signatures[0].signature, rot.signatures[0].publicKey),
+      true,
+      'Y 候选的签名应能验证 Y 的规范消息',
+    );
+    assertEqual(
+      rotationVerify(msgCrossX, rot.signatures[0].signature, rot.signatures[0].publicKey),
+      false,
+      'Y 候选的签名不应能验证 X 候选消息',
+    );
+    // 较早那份证据（X 候选上的）签署的是 X 消息，不能验证 Y 候选。
+    assertEqual(rotationVerify(msgCrossY, sigCrossAonX, crossA.publicKey), false, 'X 的早期签名不能验证 Y 候选');
+
+    const health = (await api('GET', '/healthz')).json;
+    const yEntry = health.domains.find((d) => d.id === domYId);
+    assert(yEntry && yEntry.headDigest === headYGenesis, '健康响应不得显示未授权链头');
+    assertEqual(yEntry.generation, 0);
+    assertEqual(yEntry.counts.pending, 1);
+
+    const page = await api('GET', '/');
+    assertEqual(page.status, 200, '页面应可访问');
+    assert(page.text.includes(`候选摘要 <code>${rotYDigest}</code>`), '页面应把 Y 候选显示为待签');
+    assert(
+      !page.text.includes(`代次 <strong>1</strong> · 摘要 <code>${rotYDigest}</code>`),
+      '页面不得把 Y 候选渲染为已激活检查点',
+    );
+  });
+
+  await step('跨域同名候选：两名父成员都签本候选消息后才激活，逐份核对证据', async () => {
+    const sigCrossAonY = sign(crossA, msgCrossY);
+    const res = await api('POST', `/api/domains/${domYId}/rotations/shared-rot/signatures`, {
+      signatures: [{ publicKey: crossA.publicKey, signature: sigCrossAonY }],
+    });
+    assertEqual(res.json.activated, true, '两名父成员都签 Y 候选消息后应激活');
+    assertEqual(res.json.headDigest, rotYDigest, '链头应前进到 Y 候选摘要');
+
+    const head = (await api('GET', `/api/domains/${domYId}/head`)).json;
+    assertEqual(head.digest, rotYDigest, '链头接口应显示 Y 候选已激活');
+    assertEqual(head.generation, 1);
+    assertEqual(head.evidence.length, 2, '应恰好有两份本域授权证据');
+    const signers = head.evidence.map((e) => e.publicKey).sort();
+    assert(
+      JSON.stringify(signers) === JSON.stringify([crossA.publicKey, crossB.publicKey].sort()),
+      '证据签名者应为两名父成员',
+    );
+    for (const entry of head.evidence) {
+      assertEqual(
+        rotationVerify(msgCrossY, entry.signature, entry.publicKey),
+        true,
+        '每份证据都必须能验证 Y 候选的规范 UTF-8 消息',
+      );
+      assertEqual(
+        rotationVerify(msgCrossX, entry.signature, entry.publicKey),
+        false,
+        'Y 的证据不能验证 X 候选消息',
+      );
+    }
+
+    const detail = (await api('GET', `/api/domains/${domYId}`)).json;
+    const activatedCp = detail.checkpoints.find((c) => c.digest === rotYDigest);
+    assert(activatedCp && activatedCp.status === 'activated', '域详情应包含已激活的 Y 检查点');
+    assertEqual(activatedCp.evidence.length, 2, '域详情中的证据份数应与链头一致');
+
+    const health = (await api('GET', '/healthz')).json;
+    const yEntry = health.domains.find((d) => d.id === domYId);
+    assert(yEntry && yEntry.headDigest === rotYDigest, '健康响应应显示 Y 新链头');
+
+    const page = await api('GET', '/');
+    assert(page.text.includes(`摘要 <code>${rotYDigest}</code>`), '页面应把 Y 候选显示为已激活检查点');
+    assert(page.text.includes(sigCrossAonY), '页面应显示 Y 的签名证据');
+  });
+
+  await step('跨域同名候选：第一个设备域的链头、证据与历史不受影响', async () => {
+    const detail = (await api('GET', `/api/domains/${domXId}`)).json;
+    assertEqual(detail.headDigest, headXGenesis, 'X 链头不得变化');
+    assertEqual(detail.generation, 0, 'X 代次不得变化');
+    assertEqual(detail.checkpoints.length, 1, 'X 历史仍应只有创世检查点');
+    const rot = detail.rotations.find((r) => r.rotationId === 'shared-rot');
+    assertEqual(rot.status, 'pending', 'X 候选仍应待签');
+    assertEqual(rot.signatures.length, 1, 'X 候选应只保留自己的 1 份签名');
+    assertEqual(
+      rotationVerify(msgCrossX, rot.signatures[0].signature, rot.signatures[0].publicKey),
+      true,
+      'X 保留的签名应能验证 X 候选',
+    );
+    const head = (await api('GET', `/api/domains/${domXId}/head`)).json;
+    assertEqual(head.digest, headXGenesis, 'X 链头接口结果必须不变');
+  });
+
   // —— 第二设备域：并发竞争只收敛为一个活动检查点 ——
   let domain2Id;
   let domain2Head;
@@ -342,9 +562,13 @@ async function main() {
   // —— 重启一致性 ——
   let domain1Before;
   let domain2Before;
+  let domainXBefore;
+  let domainYBefore;
   await step('应用重启后：链头、历史检查点与签名证据保持一致', async () => {
     domain1Before = (await api('GET', `/api/domains/${domainId}`)).json;
     domain2Before = (await api('GET', `/api/domains/${domain2Id}`)).json;
+    domainXBefore = (await api('GET', `/api/domains/${domXId}`)).json;
+    domainYBefore = (await api('GET', `/api/domains/${domYId}`)).json;
 
     const restart = await api('POST', '/api/admin/restart');
     assertEqual(restart.status, 202, `重启端点应返回 202：${restart.text}`);
@@ -354,6 +578,8 @@ async function main() {
 
     const domain1After = (await api('GET', `/api/domains/${domainId}`)).json;
     const domain2After = (await api('GET', `/api/domains/${domain2Id}`)).json;
+    const domainXAfter = (await api('GET', `/api/domains/${domXId}`)).json;
+    const domainYAfter = (await api('GET', `/api/domains/${domYId}`)).json;
     assert(
       JSON.stringify(domain1After) === JSON.stringify(domain1Before),
       '验收域重启前后状态不一致（链头/检查点/证据丢失）',
@@ -362,17 +588,37 @@ async function main() {
       JSON.stringify(domain2After) === JSON.stringify(domain2Before),
       '并发域重启前后状态不一致（链头/检查点/证据丢失）',
     );
+    assert(
+      JSON.stringify(domainXAfter) === JSON.stringify(domainXBefore),
+      '跨域 X 重启前后状态不一致（其链头/历史/证据不得变化）',
+    );
+    assert(
+      JSON.stringify(domainYAfter) === JSON.stringify(domainYBefore),
+      '跨域 Y 重启前后状态不一致（已激活链头与两份证据应保持）',
+    );
     const head = (await api('GET', `/api/domains/${domainId}/head`)).json;
     assertEqual(head.digest, rotationDigest, '重启后链头摘要变化');
     assertEqual(head.evidence.length, 2, '重启后签名证据份数变化');
+    const headY = (await api('GET', `/api/domains/${domYId}/head`)).json;
+    assertEqual(headY.digest, rotYDigest, '重启后 Y 链头摘要变化');
+    assertEqual(headY.evidence.length, 2, '重启后 Y 证据份数变化');
+    for (const entry of headY.evidence) {
+      assertEqual(rotationVerify(msgCrossY, entry.signature, entry.publicKey), true, '重启后 Y 证据仍须逐份可验证');
+    }
+    const headX = (await api('GET', `/api/domains/${domXId}/head`)).json;
+    assertEqual(headX.digest, headXGenesis, '重启后 X 链头仍须是创世检查点');
   });
 
   await step('健康响应在重启后仍反映设备域状态', async () => {
     const health = (await api('GET', '/healthz')).json;
     const d1 = health.domains.find((d) => d.id === domainId);
     const d2 = health.domains.find((d) => d.id === domain2Id);
+    const dx = health.domains.find((d) => d.id === domXId);
+    const dy = health.domains.find((d) => d.id === domYId);
     assert(d1 && d1.headDigest === rotationDigest, '健康响应中验收域链头不符');
     assert(d2 && d2.headDigest === domain2Head, '健康响应中并发域链头不符');
+    assert(dx && dx.headDigest === headXGenesis, '健康响应中跨域 X 链头不符');
+    assert(dy && dy.headDigest === rotYDigest, '健康响应中跨域 Y 链头不符');
   });
 
   await step('页面显示与接口相同的结果（链头、证据、检查点分组）', async () => {

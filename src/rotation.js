@@ -159,6 +159,34 @@ function mustRotation(domain, rotationId) {
 }
 
 /**
+ * 计算候选的“有效授权证据”：只有满足下列全部条件的签名才计入：
+ *  - 签名者是该候选固定父检查点的密钥成员；
+ *  - 签名能通过该候选自身规范 UTF-8 授权消息的 Ed25519 验签
+ *    （消息固定绑定设备域、轮换标识、父摘要、代次、门限与新公钥集，
+ *     因此他域同名候选的签名即使父公钥相同也无法通过）；
+ *  - 按签名者去重。
+ *
+ * 激活门限永远以这里的结果为准，而不是直接信任已存储的签名数量。
+ */
+function validEvidence(checkpoints, candidate) {
+  const parentCheckpoint = checkpoints[candidate.parentDigest];
+  if (!parentCheckpoint) return { parentCheckpoint: null, evidence: [] };
+  const message = authorizationMessage(candidate);
+  const seen = new Set();
+  const evidence = [];
+  for (const entry of Array.isArray(candidate.signatures) ? candidate.signatures : []) {
+    const publicKey = entry && typeof entry.publicKey === 'string' ? entry.publicKey : null;
+    const signature = entry && typeof entry.signature === 'string' ? entry.signature : null;
+    if (!publicKey || !signature || seen.has(publicKey)) continue;
+    if (!parentCheckpoint.keys.includes(publicKey)) continue;
+    if (!verifyAuthorization(message, signature, publicKey)) continue;
+    seen.add(publicKey);
+    evidence.push(entry);
+  }
+  return { parentCheckpoint, evidence };
+}
+
+/**
  * 创建设备域：产生创世检查点（第 0 代，立即激活）并作为链头。
  */
 function createDomain(state, input, now) {
@@ -344,7 +372,10 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
   let nextDomain = { ...domain, rotations: { ...domain.rotations, [rotationId]: nextRotation } };
   let activated = false;
 
-  if (mergedSignatures.length >= parentCheckpoint.threshold) {
+  // 激活门限以“能验证本候选自身消息的去重父成员证据”为准，
+  // 绝不直接信任已存储签名数量（防止他域同名候选的签名串用）。
+  const { evidence: authorizingEvidence } = validEvidence(nextDomain.checkpoints, nextRotation);
+  if (authorizingEvidence.length >= parentCheckpoint.threshold) {
     activated = true;
     const checkpoint = {
       digest: rotation.digest,
@@ -356,7 +387,7 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
       keys: rotation.keys,
       status: 'activated',
       activatedAt: now,
-      evidence: mergedSignatures,
+      evidence: authorizingEvidence,
     };
     nextRotation = { ...nextRotation, status: 'activated', activatedAt: now };
     const nextRotations = { ...nextDomain.rotations, [rotationId]: nextRotation };
@@ -426,6 +457,7 @@ module.exports = {
   checkpointDigest,
   authorizationMessage,
   verifyAuthorization,
+  validEvidence,
   createDomain,
   createRotation,
   submitSignatures,
