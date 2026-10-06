@@ -23,6 +23,19 @@ const path = require('node:path');
 const ROOT = path.join(__dirname, '..');
 const APP_URL = (process.env.APP_URL || 'http://127.0.0.1:3000').replace(/\/+$/, '');
 
+// Ed25519 SPKI DER 前缀（OID 1.3.101.112），后接 32 字节原始公钥。
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+/** 逐份核对证据：签名必须由公钥持有者针对指定的规范 UTF-8 消息签署。 */
+function verifies(message, signatureHex, publicKeyHex) {
+  const key = crypto.createPublicKey({
+    key: Buffer.concat([ED25519_SPKI_PREFIX, Buffer.from(publicKeyHex, 'hex')]),
+    format: 'der',
+    type: 'spki',
+  });
+  return crypto.verify(null, Buffer.from(message, 'utf8'), key, Buffer.from(signatureHex, 'hex'));
+}
+
 let failures = 0;
 
 function pass(name) {
@@ -337,6 +350,163 @@ async function main() {
     const loser = after.rotations.find((r) => r.status === 'superseded');
     assert(loser && loser.rejectedReason, '落选候选应记录拒因');
     domain2Head = after.headDigest;
+  });
+
+  // —— 跨设备域同名候选：相同父公钥集 + 同名轮换标识，证据不得跨域凑门限 ——
+  const crossParents = [genKey(), genKey()];
+  const nextX = [genKey(), genKey()];
+  const nextY = [genKey(), genKey()];
+  let crossXId;
+  let crossYId;
+  let crossXHead;
+  let crossYHead;
+  let crossDigestX;
+  let crossDigestY;
+  let msgCrossX;
+  let msgCrossY;
+  const CROSS_RID = 'cross-shared-rot';
+
+  await step('跨域场景：创建父公钥相同、门限均为二的两个设备域及同名（新公钥集不同）候选', async () => {
+    const dx = await api('POST', '/api/domains', {
+      name: '跨设备域-X',
+      publicKeys: crossParents.map((m) => m.publicKey),
+      threshold: 2,
+    });
+    const dy = await api('POST', '/api/domains', {
+      name: '跨设备域-Y',
+      publicKeys: crossParents.map((m) => m.publicKey),
+      threshold: 2,
+    });
+    assertEqual(dx.status, 201, `创建跨域 X 失败：${dx.text}`);
+    assertEqual(dy.status, 201, `创建跨域 Y 失败：${dy.text}`);
+    crossXId = dx.json.id;
+    crossYId = dy.json.id;
+    crossXHead = dx.json.headDigest;
+    crossYHead = dy.json.headDigest;
+    assert(crossXHead !== crossYHead, '不同设备域的创世摘要不应相同（域 ID 不同）');
+
+    for (const [did, head, keys, out] of [
+      [crossXId, crossXHead, nextX, 'x'],
+      [crossYId, crossYHead, nextY, 'y'],
+    ]) {
+      const res = await api('POST', `/api/domains/${did}/rotations`, {
+        rotationId: CROSS_RID,
+        parentDigest: head,
+        publicKeys: keys.map((k) => k.publicKey),
+        threshold: 2,
+      });
+      assertEqual(res.status, 201, `跨域 ${out} 创建同名候选失败：${res.text}`);
+      if (out === 'x') crossDigestX = res.json.digest;
+      else crossDigestY = res.json.digest;
+    }
+    assert(crossDigestX !== crossDigestY, '不同载荷的同名候选摘要不应相同');
+    const mx = await api('GET', `/api/domains/${crossXId}/rotations/${CROSS_RID}/message`);
+    const my = await api('GET', `/api/domains/${crossYId}/rotations/${CROSS_RID}/message`);
+    msgCrossX = mx.json.message;
+    msgCrossY = my.json.message;
+    assert(msgCrossX !== msgCrossY, '两个候选的规范待签消息必须不同');
+  });
+
+  await step('跨域场景：只为第一个候选提交一名父成员的有效签名，保持待签', async () => {
+    const sigXA = sign(crossParents[0], msgCrossX);
+    const res = await api('POST', `/api/domains/${crossXId}/rotations/${CROSS_RID}/signatures`, {
+      signatures: [{ publicKey: crossParents[0].publicKey, signature: sigXA }],
+    });
+    assertEqual(res.json.activated, false, '单名签名不应激活');
+    assertEqual(res.json.signers, 1, '应记录 1 名签名者');
+  });
+
+  await step('跨域场景：重启应用后第二个候选仍待签，链头/详情/页面/健康均无外来证据', async () => {
+    const restart = await api('POST', '/api/admin/restart');
+    assertEqual(restart.status, 202, `重启端点应返回 202：${restart.text}`);
+    const health = await waitForHealth(60000, (h) => h.bootId !== bootId);
+    bootId = health.bootId;
+
+    const rx = (await api('GET', `/api/domains/${crossXId}`)).json.rotations.find((r) => r.rotationId === CROSS_RID);
+    const ry = (await api('GET', `/api/domains/${crossYId}`)).json.rotations.find((r) => r.rotationId === CROSS_RID);
+    assertEqual(rx.status, 'pending', '第一个候选重启后应仍待签');
+    assertEqual(rx.signers, 1, '第一个候选的本域签名应保留');
+    assertEqual(ry.status, 'pending', '第二个候选不得被外来签名错误激活');
+    assertEqual(ry.signers, 0, '第一个设备域的签名不得泄漏为第二个候选的证据');
+
+    for (const [did, head] of [[crossXId, crossXHead], [crossYId, crossYHead]]) {
+      const h = (await api('GET', `/api/domains/${did}/head`)).json;
+      assertEqual(h.digest, head, `设备域 ${did} 重启后链头不应前进`);
+      assertEqual(h.evidence.length, 0, '创世链头不应带有任何签名证据');
+      const hz = (await api('GET', '/healthz')).json;
+      const entry = hz.domains.find((d) => d.id === did);
+      assertEqual(entry.headDigest, head, '健康响应中的链头与链头接口不一致');
+    }
+
+    const page = await api('GET', '/');
+    assertEqual(page.status, 200, '重启后页面应可访问');
+    assert(page.text.includes(crossXHead) && page.text.includes(crossYHead), '页面未显示两个设备域的创世链头');
+    assert(!page.text.includes(crossDigestY) || page.text.includes('待签'), '页面不得把第二个候选展示为已激活');
+  });
+
+  await step('跨域场景：第二个候选仅收到自身一名有效签名时继续待签（链头/详情/页面/健康一致）', async () => {
+    const sigYB = sign(crossParents[1], msgCrossY);
+    const res = await api('POST', `/api/domains/${crossYId}/rotations/${CROSS_RID}/signatures`, {
+      signatures: [{ publicKey: crossParents[1].publicKey, signature: sigYB }],
+    });
+    assertEqual(res.json.activated, false, '外来签名不得凑门限：仅自身一名签名必须继续待签');
+    assertEqual(res.json.signers, 1, '应仅记录第二个候选自身的 1 名签名者');
+    assertEqual(res.json.headDigest, crossYHead, '链头不得前进');
+
+    const detail = (await api('GET', `/api/domains/${crossYId}`)).json;
+    const ry = detail.rotations.find((r) => r.rotationId === CROSS_RID);
+    assertEqual(ry.status, 'pending', '详情接口中候选应仍为待签');
+    assertEqual(ry.signers, 1, '详情接口中签名者数应为 1');
+    // 逐份核对：保留的签名必须验证第二个候选自身的消息。
+    assertEqual(ry.signatures.length, 1);
+    assert(verifies(msgCrossY, ry.signatures[0].signature, ry.signatures[0].publicKey), '已收签名无法验证本候选消息');
+
+    const head = (await api('GET', `/api/domains/${crossYId}/head`)).json;
+    assertEqual(head.digest, crossYHead, '链头接口不应显示被错误激活的检查点');
+    const hz = (await api('GET', '/healthz')).json;
+    assertEqual(hz.domains.find((d) => d.id === crossYId).headDigest, crossYHead, '健康响应中的链头不一致');
+    const page = await api('GET', '/');
+    assert(page.text.includes('待签'), '页面应保持候选为待签分组');
+  });
+
+  await step('跨域场景：第二名父成员针对第二个候选消息补签后才激活，逐份证据验证本候选', async () => {
+    const sigYA = sign(crossParents[0], msgCrossY);
+    const res = await api('POST', `/api/domains/${crossYId}/rotations/${CROSS_RID}/signatures`, {
+      signatures: [{ publicKey: crossParents[0].publicKey, signature: sigYA }],
+    });
+    assertEqual(res.json.activated, true, '两名父成员都针对本候选签名后应激活');
+    assertEqual(res.json.headDigest, crossDigestY, '链头应前进到第二个候选摘要');
+
+    const head = (await api('GET', `/api/domains/${crossYId}/head`)).json;
+    assertEqual(head.digest, crossDigestY, '链头接口摘要不符');
+    assertEqual(head.evidence.length, 2, '应恰好有两份证据');
+    // 逐份证据核对：每份都验证第二个候选的规范消息，且都不能验证第一个候选的消息。
+    for (const entry of head.evidence) {
+      assert(verifies(msgCrossY, entry.signature, entry.publicKey), '证据无法验证第二个候选的规范消息');
+      assert(!verifies(msgCrossX, entry.signature, entry.publicKey), '证据不应能验证第一个设备域的消息');
+    }
+    const detail = (await api('GET', `/api/domains/${crossYId}`)).json;
+    assertEqual(detail.headDigest, crossDigestY, '域详情链头不符');
+    const cp = detail.checkpoints.find((c) => c.digest === crossDigestY);
+    assert(cp && cp.evidence.length === 2, '域详情缺少已激活检查点或证据份数不符');
+    const hz = (await api('GET', '/healthz')).json;
+    assertEqual(hz.domains.find((d) => d.id === crossYId).headDigest, crossDigestY, '健康响应链头不符');
+    const page = await api('GET', '/');
+    assert(page.text.includes(crossDigestY), '页面未显示新激活链头');
+  });
+
+  await step('跨域场景：第一个设备域的链头、证据与历史完全不受影响', async () => {
+    const detail = (await api('GET', `/api/domains/${crossXId}`)).json;
+    assertEqual(detail.headDigest, crossXHead, '第一个设备域链头不应变化');
+    assertEqual(detail.generation, 0, '第一个设备域代次不应变化');
+    assertEqual(detail.checkpoints.length, 1, '第一个设备域历史不应新增检查点');
+    const rx = detail.rotations.find((r) => r.rotationId === CROSS_RID);
+    assertEqual(rx.status, 'pending', '第一个设备域的同名候选应仍待签');
+    assertEqual(rx.signers, 1, '第一个设备域的候选应仍只有自身那 1 份签名');
+    assert(verifies(msgCrossX, rx.signatures[0].signature, rx.signatures[0].publicKey), '第一域证据必须验证其自身消息');
+    const head = (await api('GET', `/api/domains/${crossXId}/head`)).json;
+    assertEqual(head.digest, crossXHead, '链头接口中第一域链头变化');
+    assertEqual(head.evidence.length, 0, '第一域创世链头不应出现证据');
   });
 
   // —— 重启一致性 ——

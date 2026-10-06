@@ -146,6 +146,165 @@ function verifyAuthorization(message, signatureHex, publicKeyHex) {
   }
 }
 
+/**
+ * 重新核验候选已收集的全部签名证据。
+ *
+ * 证据永远只属于其创建时固定的设备域、父摘要与候选载荷：签名者必须是
+ * 父检查点密钥成员，且签名必须通过“该候选自身”的规范 UTF-8 消息验签。
+ * 去重后返回仍然有效的证据（保持原有条目与接收时间）。
+ * 用于激活前防御性复核，以及对历史受损持久化记录的修复。
+ */
+function validEvidence(rotation, parentCheckpoint) {
+  const message = authorizationMessage(rotation);
+  const seen = new Set();
+  const valid = [];
+  for (const entry of rotation.signatures || []) {
+    const publicKey = entry && typeof entry.publicKey === 'string' ? entry.publicKey : null;
+    const signature = entry && typeof entry.signature === 'string' ? entry.signature : null;
+    if (!publicKey || !signature || seen.has(publicKey)) continue;
+    if (!parentCheckpoint.keys.includes(publicKey)) continue;
+    if (!verifyAuthorization(message, signature, publicKey)) continue;
+    seen.add(publicKey);
+    valid.push(entry);
+  }
+  return valid;
+}
+
+/**
+ * 校验一个已激活检查点的授权链是否完整：摘要自洽、父检查点在位、
+ * 每份证据都由父密钥成员针对“该检查点自身”的规范 UTF-8 消息签署，
+ * 且去重后的签名者数达到父门限。
+ */
+function isCheckpointAuthorized(checkpoint, parentCheckpoint) {
+  if (checkpoint.parentDigest !== parentCheckpoint.digest) return false;
+  if (checkpointDigest(checkpoint) !== checkpoint.digest) return false;
+  const seen = new Set();
+  for (const entry of checkpoint.evidence || []) {
+    const publicKey = entry && typeof entry.publicKey === 'string' ? entry.publicKey : null;
+    const signature = entry && typeof entry.signature === 'string' ? entry.signature : null;
+    if (!publicKey || !signature || seen.has(publicKey)) continue;
+    if (!parentCheckpoint.keys.includes(publicKey)) continue;
+    if (!verifyAuthorization(authorizationMessage(checkpoint), signature, publicKey)) return false;
+    seen.add(publicKey);
+  }
+  return seen.size >= parentCheckpoint.threshold;
+}
+
+/**
+ * 修复单个设备域的历史状态：
+ *  - 从创世检查点起按代次重放授权链，任何证据无法通过本域校验的检查点
+ *    都不再视为已激活（从检查点集合中移除，链头回退到最近的完整授权祖先）；
+ *  - 各候选的已收签名按其“自身”规范消息与父成员身份重新核验，
+ *    外来/无法验证的签名不再作为本域证据保留；
+ *  - 被错误激活的候选回退为待签（保留其已通过本域核验的签名，可继续补签）；
+ *  - 若取代他人的激活被撤销，同一下的被取代候选恢复为待签。
+ * 返回修复后的域与修复变更计数。
+ */
+function reconcileDomain(domain) {
+  let changes = 0;
+  const checkpoints = { ...domain.checkpoints };
+  const sorted = Object.values(checkpoints).sort((a, b) => a.generation - b.generation);
+
+  const validDigests = new Set();
+  for (const cp of sorted) {
+    if (cp.generation === 0 && cp.parentDigest === GENESIS_PARENT_DIGEST) {
+      if (cp.status === 'activated' && checkpointDigest(cp) === cp.digest) {
+        validDigests.add(cp.digest);
+        continue;
+      }
+    }
+    const parent = checkpoints[cp.parentDigest];
+    const authorized =
+      cp.status === 'activated' &&
+      parent &&
+      validDigests.has(parent.digest) &&
+      isCheckpointAuthorized(cp, parent);
+    if (authorized) {
+      validDigests.add(cp.digest);
+    } else if (cp.generation !== 0) {
+      changes += 1; // 未经本域完整授权的活动检查点不得保留
+    }
+  }
+
+  // 创世检查点都不完整时无法安全修复，保持原样交由人工处理。
+  const genesis = sorted.find((cp) => cp.generation === 0);
+  if (!genesis || !validDigests.has(genesis.digest)) return { domain, changes: 0 };
+
+  const head = [...validDigests]
+    .map((digest) => checkpoints[digest])
+    .sort((a, b) => a.generation - b.generation)
+    .at(-1);
+
+  // 若取代他人的激活未通过本域授权校验，则同一下的被取代候选恢复待签：
+  // 判定依据是“不存在以该候选父摘要为父的有效已激活检查点”。
+  const activatedChildrenByParent = new Set();
+  for (const digest of validDigests) {
+    activatedChildrenByParent.add(checkpoints[digest].parentDigest);
+  }
+
+  const rotations = {};
+  for (const rotation of Object.values(domain.rotations)) {
+    let next = { ...rotation };
+    const parent = checkpoints[rotation.parentDigest];
+    const good = parent ? validEvidence(rotation, parent) : [];
+    if (good.length !== (rotation.signatures || []).length) changes += 1;
+    next.signatures = good;
+
+    if (next.status === 'activated' && !validDigests.has(rotation.digest)) {
+      // 激活所依据的证据不完整：回退为待签，已核验的本域签名仍可继续凑门限。
+      next = { ...next, status: 'pending', activatedAt: null, rejectedReason: null };
+      changes += 1;
+    } else if (
+      next.status === 'superseded' &&
+      validDigests.has(next.parentDigest) &&
+      !activatedChildrenByParent.has(next.parentDigest)
+    ) {
+      // 取代它的激活未通过本域授权校验，候选重新可签。
+      next = { ...next, status: 'pending', rejectedReason: null, supersededAt: null };
+      changes += 1;
+    }
+    rotations[next.rotationId] = next;
+  }
+
+  for (const cp of sorted) {
+    if (!validDigests.has(cp.digest)) delete checkpoints[cp.digest];
+  }
+
+  const repaired = {
+    ...domain,
+    headDigest: head.digest,
+    generation: head.generation,
+    keys: head.keys,
+    threshold: head.threshold,
+    checkpoints,
+    rotations,
+  };
+  if (
+    domain.headDigest !== head.digest ||
+    domain.generation !== head.generation ||
+    domain.threshold !== head.threshold ||
+    JSON.stringify(domain.keys) !== JSON.stringify(head.keys)
+  ) {
+    changes += 1;
+  }
+  return { domain: repaired, changes };
+}
+
+/**
+ * 启动加载时修复全部设备域状态。返回 { state, changes }；
+ * changes > 0 时调用方应把修复后的状态重新原子落盘。
+ */
+function reconcileState(state) {
+  let changes = 0;
+  const domains = {};
+  for (const domain of Object.values(state.domains || {})) {
+    const outcome = reconcileDomain(domain);
+    domains[outcome.domain.id] = outcome.domain;
+    changes += outcome.changes;
+  }
+  return { state: { ...state, domains }, changes };
+}
+
 function mustDomain(state, domainId) {
   const domain = state.domains[domainId];
   if (!domain) throw new DomainError('unknown_domain', `设备域不存在：${domainId}`);
@@ -344,7 +503,15 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
   let nextDomain = { ...domain, rotations: { ...domain.rotations, [rotationId]: nextRotation } };
   let activated = false;
 
-  if (mergedSignatures.length >= parentCheckpoint.threshold) {
+  // 防御性复核：证据只属于本候选固定的设备域/父摘要/载荷，
+  // 任何无法针对“本候选自身”规范消息验签的历史记录都不得凑门限。
+  const verifiedSignatures = validEvidence(nextRotation, parentCheckpoint);
+  if (verifiedSignatures.length !== mergedSignatures.length) {
+    nextRotation = { ...nextRotation, signatures: verifiedSignatures };
+    nextDomain = { ...domain, rotations: { ...domain.rotations, [rotationId]: nextRotation } };
+  }
+
+  if (verifiedSignatures.length >= parentCheckpoint.threshold) {
     activated = true;
     const checkpoint = {
       digest: rotation.digest,
@@ -356,7 +523,7 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
       keys: rotation.keys,
       status: 'activated',
       activatedAt: now,
-      evidence: mergedSignatures,
+      evidence: verifiedSignatures,
     };
     nextRotation = { ...nextRotation, status: 'activated', activatedAt: now };
     const nextRotations = { ...nextDomain.rotations, [rotationId]: nextRotation };
@@ -388,7 +555,7 @@ function submitSignatures(state, domainId, rotationId, signatures, now) {
       rotation: nextDomain.rotations[rotationId],
       results,
       activated,
-      signers: mergedSignatures.length,
+      signers: nextDomain.rotations[rotationId].signatures.length,
       threshold: parentCheckpoint.threshold,
       headDigest: nextDomain.headDigest,
     },
@@ -426,6 +593,10 @@ module.exports = {
   checkpointDigest,
   authorizationMessage,
   verifyAuthorization,
+  validEvidence,
+  isCheckpointAuthorized,
+  reconcileDomain,
+  reconcileState,
   createDomain,
   createRotation,
   submitSignatures,

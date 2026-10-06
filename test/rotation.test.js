@@ -266,6 +266,155 @@ test('持久化：提交后重载状态一致；并发补签只收敛为一个�
   assert.ok(!fs.existsSync(`${file}.tmp`), '原子提交不残留临时文件');
 });
 
+test('跨设备域同名候选：重启后外来签名不得凑门限，逐份证据必须能验证本候选', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-cross-'));
+  const file = path.join(dir, 'state.json');
+  const store = new Store(file);
+  store.load();
+
+  // 两个设备域使用完全相同的父公钥集与门限 2。
+  const parents = [genKey(), genKey()];
+  const domainX = await store.commit((s) =>
+    rotation.createDomain(s, { name: '跨域-X', publicKeys: parents.map((k) => k.publicKey), threshold: 2 }, NOW));
+  const domainY = await store.commit((s) =>
+    rotation.createDomain(s, { name: '跨域-Y', publicKeys: parents.map((k) => k.publicKey), threshold: 2 }, NOW));
+
+  // 同名轮换标识，但新公钥集不同 → 规范消息必然不同。
+  const nextX = [genKey(), genKey()];
+  const nextY = [genKey(), genKey()];
+  await store.commit((s) => rotation.createRotation(s, domainX.id, {
+    rotationId: 'shared-rot', parentDigest: domainX.headDigest,
+    publicKeys: nextX.map((k) => k.publicKey), threshold: 2,
+  }, NOW));
+  await store.commit((s) => rotation.createRotation(s, domainY.id, {
+    rotationId: 'shared-rot', parentDigest: domainY.headDigest,
+    publicKeys: nextY.map((k) => k.publicKey), threshold: 2,
+  }, NOW));
+
+  const rotX = () => store.state.domains[domainX.id].rotations['shared-rot'];
+  const rotY = () => store.state.domains[domainY.id].rotations['shared-rot'];
+  const msgX = rotation.authorizationMessage(rotX());
+  const msgY = rotation.authorizationMessage(rotY());
+  assert.notEqual(msgX, msgY, '不同设备域/载荷的规范消息必须不同');
+
+  // 重启前：只为第一个候选提交一名父成员的有效签名。
+  const sigXA = sign(parents[0].privateKey, msgX);
+  const submitX = await store.commit((s) => rotation.submitSignatures(
+    s, domainX.id, 'shared-rot', [{ publicKey: parents[0].publicKey, signature: sigXA }], NOW));
+  assert.equal(submitX.activated, false);
+  assert.equal(submitX.signers, 1);
+
+  // 重启（旧实现会把同名候选的签名数组跨域覆盖）。
+  const reloaded = new Store(file);
+  reloaded.load();
+  const rx = reloaded.state.domains[domainX.id].rotations['shared-rot'];
+  const ry = reloaded.state.domains[domainY.id].rotations['shared-rot'];
+  assert.equal(rx.status, 'pending');
+  assert.equal(rx.signatures.length, 1, '第一个设备域的签名应保留');
+  assert.equal(ry.status, 'pending', '第二个候选重启后必须仍然待签');
+  assert.equal(ry.signatures.length, 0, '第一个设备域的签名不得泄漏到同名候选');
+  assert.equal(reloaded.state.domains[domainY.id].headDigest, domainY.headDigest, '第二域链头不得前进');
+  assert.equal(reloaded.state.domains[domainX.id].headDigest, domainX.headDigest, '第一域链头不得变化');
+
+  // 重启后：只为第二个候选提交另一名父成员针对“其自身消息”的签名。
+  const sigYB = sign(parents[1].privateKey, msgY);
+  const oneForY = rotation.submitSignatures(
+    reloaded.state, domainY.id, 'shared-rot',
+    [{ publicKey: parents[1].publicKey, signature: sigYB }], NOW);
+  assert.equal(oneForY.result.activated, false, '仅一名本域有效签名时必须继续待签');
+  assert.equal(oneForY.result.signers, 1);
+  assert.equal(oneForY.state.domains[domainY.id].headDigest, domainY.headDigest);
+
+  // 两名父成员都针对第二个候选的规范 UTF-8 消息签名后才激活。
+  const sigYA = sign(parents[0].privateKey, msgY);
+  const activated = rotation.submitSignatures(
+    oneForY.state, domainY.id, 'shared-rot',
+    [{ publicKey: parents[0].publicKey, signature: sigYA }], NOW);
+  assert.equal(activated.result.activated, true);
+  const yAfter = activated.state.domains[domainY.id];
+  assert.equal(yAfter.headDigest, rotY().digest);
+  const evidence = yAfter.checkpoints[yAfter.headDigest].evidence;
+  assert.equal(evidence.length, 2);
+  // 逐份证据核对：每份都必须能验证第二个候选自身的消息。
+  for (const entry of evidence) {
+    assert.ok(
+      rotation.verifyAuthorization(msgY, entry.signature, entry.publicKey),
+      '证据无法验证第二个候选的规范消息',
+    );
+    assert.ok(
+      !rotation.verifyAuthorization(msgX, entry.signature, entry.publicKey),
+      '证据不应能验证第一个设备域的消息',
+    );
+  }
+
+  // 第一个设备域的链头、证据与历史完全不受影响。
+  const xAfter = activated.state.domains[domainX.id];
+  assert.equal(xAfter.headDigest, domainX.headDigest);
+  assert.equal(xAfter.rotations['shared-rot'].status, 'pending');
+  assert.equal(xAfter.rotations['shared-rot'].signatures.length, 1);
+  assert.deepEqual(xAfter.checkpoints, store.state.domains[domainX.id].checkpoints);
+});
+
+test('历史受损记录修复：带外来证据的错误活动链头在加载时回退，外来签名被清除', () => {
+  const parents = [genKey(), genKey()];
+  const { state: s0, domain: dx } = makeDomain(freshState(), parents, 2);
+  const createdY = rotation.createDomain(s0, { name: '跨域-Y', publicKeys: parents.map((k) => k.publicKey), threshold: 2 }, NOW);
+  const s1 = createdY.state;
+  const dy = createdY.result;
+  const nextX = [genKey(), genKey()];
+  const nextY = [genKey(), genKey()];
+  const s2 = rotation.createRotation(s1, dx.id, {
+    rotationId: 'shared-rot', parentDigest: dx.headDigest,
+    publicKeys: nextX.map((k) => k.publicKey), threshold: 2,
+  }, NOW).state;
+  const s3 = rotation.createRotation(s2, dy.id, {
+    rotationId: 'shared-rot', parentDigest: dy.headDigest,
+    publicKeys: nextY.map((k) => k.publicKey), threshold: 2,
+  }, NOW).state;
+
+  const rx = s3.domains[dx.id].rotations['shared-rot'];
+  const ry = s3.domains[dy.id].rotations['shared-rot'];
+  const msgX = rotation.authorizationMessage(rx);
+  const msgY = rotation.authorizationMessage(ry);
+  // 旧的落盘缺陷会让 Y 持有 X 的签名；再补一份 Y 自身签名后被错误激活。
+  const foreign = { publicKey: parents[0].publicKey, signature: sign(parents[0].privateKey, msgX), receivedAt: NOW };
+  const own = { publicKey: parents[1].publicKey, signature: sign(parents[1].privateKey, msgY), receivedAt: NOW };
+  const corrupted = structuredClone(s3);
+  const yDomain = corrupted.domains[dy.id];
+  yDomain.rotations['shared-rot'] = {
+    ...ry, status: 'activated', activatedAt: NOW, signatures: [foreign, own],
+  };
+  yDomain.checkpoints[ry.digest] = {
+    digest: ry.digest, domainId: dy.id, rotationId: 'shared-rot', parentDigest: ry.parentDigest,
+    generation: ry.generation, threshold: ry.threshold, keys: ry.keys,
+    status: 'activated', activatedAt: NOW, evidence: [foreign, own],
+  };
+  yDomain.headDigest = ry.digest;
+  yDomain.generation = 1;
+  yDomain.keys = ry.keys;
+  yDomain.threshold = ry.threshold;
+
+  assert.equal(rotation.isCheckpointAuthorized(
+    yDomain.checkpoints[ry.digest], yDomain.checkpoints[ry.parentDigest]), false);
+
+  const repairedOnce = rotation.reconcileState(corrupted);
+  assert.ok(repairedOnce.changes > 0, '修复应报告变更');
+  const yFixed = repairedOnce.state.domains[dy.id];
+  assert.equal(yFixed.headDigest, dy.headDigest, '未经本域完整授权的链头必须回退');
+  assert.equal(yFixed.generation, 0);
+  assert.equal(yFixed.checkpoints[ry.digest], undefined, '无法验证的活动检查点不得保留');
+  assert.equal(yFixed.rotations['shared-rot'].status, 'pending', '候选应回退为待签');
+  assert.deepEqual(
+    yFixed.rotations['shared-rot'].signatures.map((e) => e.publicKey),
+    [parents[1].publicKey],
+    '外来签名必须清除，仅保留通过本域消息验签的签名',
+  );
+  // 第一个设备域不被修复过程改动。
+  assert.deepEqual(repairedOnce.state.domains[dx.id], s3.domains[dx.id]);
+  // 修复幂等：再次校验不再产生变更。
+  assert.equal(rotation.reconcileState(repairedOnce.state).changes, 0);
+});
+
 test('持久化：竞争候选并发达标，磁盘上只有一个活动检查点', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-race-'));
   const store = new Store(path.join(dir, 'state.json'));
