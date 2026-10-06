@@ -1,0 +1,16 @@
+{
+  "name": "maintenance-key-rotation",
+  "version": "1.0.0",
+  "private": true,
+  "description": "隔离维护网设备域命令签发密钥轮换服务（Ed25519 门限授权链）",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "test": "node --test test/",
+    "check": "node scripts/build-check.js",
+    "verify": "node scripts/verify.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
